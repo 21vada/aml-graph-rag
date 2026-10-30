@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Model artifacts (binary, regenerate from Colab)
+models/xgb_tabular.json
+models/*.bin
+models/*.pt
+
+# Keep small metadata
+!models/feature_names.json
+!models/logged_features.json
+!models/model_meta.json
+!models/.gitkeep
+
+# Data
+data/*.tar.gz
+data/*.zip
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Env template (we'll restore this separately)
