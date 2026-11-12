@@ -1,11 +1,11 @@
-cat > .dockerignore << 'EOF'
 .venv/
 .git/
 .github/
 __pycache__/
 *.pyc
 .env
+.env.example
 *.ipynb
 notebooks/
+screenshots/
 .DS_Store
-EOF

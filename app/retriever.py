@@ -32,7 +32,7 @@ class AMLEvidenceRetriever:
         RETURN s.id AS source, r.id AS target,
                t.amount_paid AS amount_paid, t.amount_received AS amount_received,
                t.currency_paid AS currency_paid, t.currency_received AS currency_received,
-               t.payment_format AS payment_format, t.timestamp AS time, t.label AS label,
+               t.payment_format AS payment_format, t.timestamp AS time,
                s_sent, r_received
         """
 
@@ -50,7 +50,7 @@ class AMLEvidenceRetriever:
             f"  {rec['source']} -> {rec['target']}\n"
             f"  Amount paid: {rec['amount_paid']} {rec['currency_paid']}\n"
             f"  Amount received: {rec['amount_received']} {rec['currency_received']}\n"
-            f"  Format: {rec['payment_format']} | At: {rec['time']} | label={rec['label']}\n"
+            f"  Format: {rec['payment_format']} | At: {rec['time']}\n"
             f"\nSENDER's recent outgoing:\n"
             f"{json.dumps(rec['s_sent'], indent=2, default=str)}\n"
             f"\nRECEIVER's recent incoming:\n"
