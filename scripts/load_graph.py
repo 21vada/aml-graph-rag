@@ -10,9 +10,14 @@ from neo4j import GraphDatabase
 
 URI      = os.getenv("NEO4J_URI",      "bolt://127.0.0.1:7687")
 USER     = os.getenv("NEO4J_USER",     "neo4j")
-PASSWORD = os.getenv("NEO4J_PASSWORD", "amlpassword123")
+PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "sample_graph.csv")
 
+if not PASSWORD:
+    raise SystemExit(
+        "NEO4J_PASSWORD is not set. Export it or put it in .env "
+        "(see .env.example / docker-compose.yml)."
+    )
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(f"CSV not found at {CSV_PATH}")
 
@@ -35,19 +40,24 @@ BATCH = 500
 with driver.session() as s:
     for i in range(0, len(rows), BATCH):
         batch = rows[i:i+BATCH]
+        # MERGE (not CREATE) on the natural key (source, target, timestamp,
+        # amount_paid) so re-running the loader — or duplicate CSV rows that
+        # share src/tgt/ts but differ in amount/label — never produces
+        # parallel duplicate edges. The sample CSV has 20 such groups.
         s.run("""
             UNWIND $rows AS row
             MERGE (a:Account {id: row.source})
             MERGE (b:Account {id: row.target})
-            CREATE (a)-[:TRANSACTION {
-                amount_paid:       toFloat(row.amount_paid),
-                amount_received:   toFloat(row.amount_received),
-                currency_paid:     row.currency_paid,
-                currency_received: row.currency_received,
-                payment_format:    row.payment_format,
-                timestamp:         row.timestamp,
-                label:             toInteger(row.label)
+            MERGE (a)-[t:TRANSACTION {
+                timestamp:   row.timestamp,
+                amount_paid: toFloat(row.amount_paid)
             }]->(b)
+            ON CREATE SET
+                t.amount_received   = toFloat(row.amount_received),
+                t.currency_paid     = row.currency_paid,
+                t.currency_received = row.currency_received,
+                t.payment_format    = row.payment_format,
+                t.label             = toInteger(row.label)
         """, rows=batch)
         print(f"  loaded {min(i+BATCH, len(rows)):,}/{len(rows):,}")
 

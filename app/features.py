@@ -34,12 +34,20 @@ def _static_features(tx: dict) -> dict:
     amt = float(tx.get("amount_paid", 0.0))
     ts  = tx.get("timestamp", "")
 
-    # Cyclical time-of-day (matches training: sin_hour, cos_hour)
-    try:
-        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M")
-        hour_frac = (dt.hour * 3600 + dt.minute * 60) / 86400.0
-    except (ValueError, TypeError):
-        hour_frac = 0.0
+    # Cyclical time-of-day (matches training: sin_hour, cos_hour).
+    # The IBM HI-Small dataset (and this repo's sample CSV) uses slash-separated
+    # timestamps like "2022/09/10 11:00"; accept dash form too for robustness.
+    hour_frac = 0.0
+    if isinstance(ts, str) and ts.strip():
+        ts = ts.strip()
+        for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M",
+                    "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(ts, fmt)
+                hour_frac = (dt.hour * 3600 + dt.minute * 60) / 86400.0
+                break
+            except ValueError:
+                continue
     angle = hour_frac * 2 * np.pi
 
     return {

@@ -1,8 +1,9 @@
 # app/main.py
+import asyncio
 import json
 import os
-import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import numpy as np
 import xgboost as xgb
@@ -39,9 +40,9 @@ class ExplainResponse(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     score: ScoreResponse
-    explanation: str = None
-    evidence_context: str = None
-    explain_model: str = None
+    explanation: Optional[str] = None
+    evidence_context: Optional[str] = None
+    explain_model: Optional[str] = None
 
 
 # ============================================================
@@ -49,26 +50,50 @@ class AnalyzeResponse(BaseModel):
 # ============================================================
 _models = {}
 
+def _model_path() -> str:
+    """Resolve the XGBoost artifact to serve.
+
+    Priority:
+      1. $MODEL_PATH if set
+      2. models/xgb_tabular.json (the real trained model; not committed)
+      3. models/demo_xgb.json   (local demo model from scripts/make_demo_model.py)
+    """
+    env_path = os.getenv("MODEL_PATH", "").strip()
+    if env_path:
+        return env_path
+    base = os.path.join(os.path.dirname(__file__), "..", "models")
+    for name in ("xgb_tabular.json", "demo_xgb.json"):
+        p = os.path.abspath(os.path.join(base, name))
+        if os.path.exists(p):
+            return p
+    # Nothing found — return the canonical path so the error message is clear.
+    return os.path.abspath(os.path.join(base, "xgb_tabular.json"))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ---- 1. XGBoost ----
-    model_path = os.path.join(
-        os.path.dirname(__file__), "..", "models", "xgb_tabular.json"
-    )
+    model_path = _model_path()
     if not os.path.exists(model_path):
-        raise RuntimeError(f"Model not found at {model_path}")
+        raise RuntimeError(
+            f"Model not found at {model_path}. Generate the local demo model with:\n"
+            f"    python scripts/make_demo_model.py\n"
+            f"or place the trained artifact (from Colab) at models/xgb_tabular.json."
+        )
     clf = xgb.XGBClassifier()
     clf.load_model(model_path)
     _models["xgb"] = clf
-    print(f"✅ Loaded XGBoost model ({HEADLINE})")
+    print(f"✅ Loaded XGBoost model from {os.path.basename(model_path)} ({HEADLINE})")
 
-    # ---- 2. Neo4j (retry up to 60s) ----
+    # ---- 2. Neo4j (retry up to 60s, non-blocking) ----
     uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    password = os.getenv("NEO4J_PASSWORD", "")
+    if not password:
+        print("⚠️  NEO4J_PASSWORD not set. Set it in .env (see .env.example).")
     driver = GraphDatabase.driver(
         uri,
         auth=(
             os.getenv("NEO4J_USER", "neo4j"),
-            os.getenv("NEO4J_PASSWORD", "amlpassword123"),
+            password,
         ),
         keep_alive=True,
         connection_acquisition_timeout=5,
@@ -78,7 +103,7 @@ async def lifespan(app: FastAPI):
     last_err = None
     for attempt in range(1, 31):          # 30 × 2s = 60s max
         try:
-            driver.verify_connectivity()
+            await asyncio.to_thread(driver.verify_connectivity)
             connected = True
             print(f"✅ Connected to Neo4j ({uri}) after ~{attempt * 2}s")
             break
@@ -86,7 +111,7 @@ async def lifespan(app: FastAPI):
             last_err = e
             if attempt == 1 or attempt % 5 == 0:
                 print(f"  Neo4j not ready (attempt {attempt}/30): {type(e).__name__}")
-            time.sleep(2)
+            await asyncio.sleep(2)
 
     if connected:
         _models["driver"] = driver
@@ -102,7 +127,7 @@ async def lifespan(app: FastAPI):
         try:
             from google import genai
             _models["gemini"] = genai.Client(api_key=gemini_key)
-            print(f"✅ Gemini client ready (key starts: {gemini_key[:6]}...)")
+            print("✅ Gemini client ready")
         except Exception as e:
             print(f"⚠️  Gemini client init failed: {e}")
             _models["gemini"] = None
@@ -166,17 +191,25 @@ def _score_one(tx: Transaction) -> ScoreResponse:
         raise HTTPException(503, "model not loaded")
     X = build_features(tx.model_dump())
     raw_logit = float(_models["xgb"].predict(X, output_margin=True)[0])
-    prob = 1.0 / (1.0 + np.exp(-raw_logit))
+    prob = float(1.0 / (1.0 + np.exp(-raw_logit)))
+    # Scale consistency: model_meta.json's threshold is fitted on the
+    # validation-set PROBABILITY scale (see notebooks/graphrag_ex_aml.ipynb).
+    # If the shipped threshold is outside [0, 1] it was exported from raw
+    # margins; convert it to a probability so `flagged` and `risk_score`
+    # are always reported on the same scale.
+    thr_prob = THRESHOLD if 0.0 <= THRESHOLD <= 1.0 else float(
+        1.0 / (1.0 + np.exp(-THRESHOLD))
+    )
     return ScoreResponse(
         risk_score=prob,
-        flagged=raw_logit >= THRESHOLD,
-        threshold=THRESHOLD,
+        flagged=prob >= thr_prob,
+        threshold=thr_prob,
         model=HEADLINE,
     )
 
 
-GEMINI_PRIMARY = "gemini-3.5-flash-lite"
-GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-2.5-flash"]
+GEMINI_PRIMARY = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 AML_PROMPT = """You are a senior AML compliance analyst reviewing a transaction
 flagged by our model.
@@ -254,20 +287,21 @@ def explain(tx: Transaction):
 def analyze(tx: Transaction, explain_if_flagged: bool = True):
     """Score first; explain only if flagged (unless explicitly requested)."""
     s = _score_one(tx)
-    if not s.flagged and not explain_if_flagged:
-        return AnalyzeResponse(score=s)
-
-    try:
-        e = _explain_one(tx)
-        return AnalyzeResponse(
-            score=s,
-            explanation=e.explanation,
-            evidence_context=e.evidence_context,
-            explain_model=e.model_used,
-        )
-    except HTTPException as eh:
-        # Score is valid; explanation failed — return score with a note
-        return AnalyzeResponse(
-            score=s,
-            explanation=f"[explain unavailable: {eh.detail}]",
-        )
+    # Explain when the transaction is flagged, or when the caller opted out
+    # of the flag-only behaviour (explain_if_flagged=False → always explain).
+    if s.flagged or not explain_if_flagged:
+        try:
+            e = _explain_one(tx)
+            return AnalyzeResponse(
+                score=s,
+                explanation=e.explanation,
+                evidence_context=e.evidence_context,
+                explain_model=e.model_used,
+            )
+        except HTTPException as eh:
+            # Score is valid; explanation failed — return score with a note
+            return AnalyzeResponse(
+                score=s,
+                explanation=f"[explain unavailable: {eh.detail}]",
+            )
+    return AnalyzeResponse(score=s)
